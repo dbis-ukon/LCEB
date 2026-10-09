@@ -124,10 +124,8 @@ python3 inject_true_postgresql.py
 ```
 
 
-## 5. Dataset
 
-We use the IMDB dataset for our experiments. The dataset, along with its schema, can be downloaded [here](https://cloud.uni-konstanz.de/index.php/s/s2mY4QTzJN3NnA8).
 
-## 6. Benchmark
+## 5. Benchmark
 
 LCEB contains 700 SQL queries, each including LIKE-predicates generated for LPLM. For any other cardinality estimation method, simply replace LCEB's LIKE-patterns with the patterns supported by that method.
