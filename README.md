@@ -128,4 +128,4 @@ python3 inject_true_postgresql.py
 
 ## 5. Benchmark
 
-LCEB contains 1000 SQL queries, each including LIKE-predicates generated for LPLM. For any other cardinality estimation method, simply replace LCEB's LIKE-patterns with the patterns supported by that method.
+LCEB contains 1000 SQL queries for both IMDb and StackOverflow. For any cardinality estimation method, simply replace LCEB's LIKE-patterns (%%) with the patterns supported by that method.
