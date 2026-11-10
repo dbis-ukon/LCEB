@@ -117,10 +117,10 @@ These files are then injected into PostgreSQL and DuckDB using the following scr
 To run:
 
 ```bash
-python3 inject_estimates_duckdb.py
-python3 inject_true_duckdb.py
-python3 inject_estimates_postgresql.py
-python3 inject_true_postgresql.py
+python3 duckdb_injected_estimated_card.py
+python3 duckdb_injected_true_card.py
+python3 postgresql_injected_estimated_card.py
+python3 postgresql_injected_true_card.py
 ```
 
 
