@@ -109,10 +109,10 @@ These files are then injected into PostgreSQL and DuckDB using the following scr
 
 | System | Injection Type | Script |
 |--------|----------------|--------|
-| DuckDB | Estimated cardinalities | `inject_estimates_duckdb.py` |
-| DuckDB | True cardinalities | `inject_true_duckdb.py` |
-| PostgreSQL | Estimated cardinalities | `inject_estimates_postgresql.py` |
-| PostgreSQL | True cardinalities | `inject_true_postgresql.py` |
+| DuckDB | Estimated cardinalities | `duckdb_injected_estimated_card.py` |
+| DuckDB | True cardinalities | `duckdb_injected_true_card.py` |
+| PostgreSQL | Estimated cardinalities | `postgresql_injected_estimated_card.py` |
+| PostgreSQL | True cardinalities | `postgresql_injected_true_card.py` |
 
 To run:
 
