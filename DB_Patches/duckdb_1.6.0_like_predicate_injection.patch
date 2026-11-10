@@ -64,6 +64,37 @@ diff -ruN '--exclude=*.bak*' duckdb-clean/src/optimizer/CMakeLists.txt duckdb/sr
    optimizer.cpp
    outer_join_simplification.cpp
    partial_aggregate_pushdown.cpp
+diff -ruN '--exclude=*.bak*' duckdb-clean/src/optimizer/join_order/cardinality_estimator.cpp duckdb/src/optimizer/join_order/cardinality_estimator.cpp
+--- duckdb-clean/src/optimizer/join_order/cardinality_estimator.cpp	2026-07-31 16:22:35.701188376 +0200
++++ duckdb/src/optimizer/join_order/cardinality_estimator.cpp	2026-10-20 11:33:38.903787479 +0200
+@@ -10,7 +10,7 @@
+ #include "duckdb/planner/operator/logical_comparison_join.hpp"
+ #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+ #include "duckdb/storage/data_table.hpp"
+-
++#include "duckdb/optimizer/like_selectivity.hpp"
+ #include <math.h>
+ 
+ namespace duckdb {
+@@ -914,12 +914,16 @@
+ double CardinalityEstimator::ApplyOrFilterSelectivities(JoinRelationSet &new_set, double cardinality) const {
+ 	for (auto &filter : state->or_filters) {
+ 		if (JoinRelationSet::IsSubset(new_set, filter->set.get())) {
+-			cardinality *= RelationStatisticsHelper::DEFAULT_SELECTIVITY;
++			double selectivity;
++			if (filter->filter && LikeSelectivity::TryGetLikeSelectivity(*filter->filter, selectivity)) {
++				cardinality *= selectivity; // injected: 1 - (1 - s_cn)(1 - s_t)
++			} else {
++				cardinality *= RelationStatisticsHelper::DEFAULT_SELECTIVITY;
++			}
+ 		}
+ 	}
+ 	return cardinality;
+ }
+-
+ template <>
+ idx_t CardinalityEstimator::EstimateCardinalityWithSet(JoinRelationSet &new_set) {
+ 	auto cardinality_as_double = EstimateCardinalityWithSet<double>(new_set);
 diff -ruN '--exclude=*.bak*' duckdb-clean/src/optimizer/join_order/relation_manager.cpp duckdb/src/optimizer/join_order/relation_manager.cpp
 --- duckdb-clean/src/optimizer/join_order/relation_manager.cpp	2026-07-31 16:22:36.329221911 +0200
 +++ duckdb/src/optimizer/join_order/relation_manager.cpp	2026-07-24 14:31:23.181760810 +0200
@@ -209,8 +240,8 @@ diff -ruN '--exclude=*.bak*' duckdb-clean/src/optimizer/join_order/relation_stat
  			    1U);
 diff -ruN '--exclude=*.bak*' duckdb-clean/src/optimizer/like_selectivity.cpp duckdb/src/optimizer/like_selectivity.cpp
 --- duckdb-clean/src/optimizer/like_selectivity.cpp	1970-01-01 01:00:00.000000000 +0100
-+++ duckdb/src/optimizer/like_selectivity.cpp	2026-07-31 15:15:48.737618071 +0200
-@@ -0,0 +1,260 @@
++++ duckdb/src/optimizer/like_selectivity.cpp	2026-10-20 11:09:01.847116167 +0200
+@@ -0,0 +1,281 @@
 +#include "duckdb/optimizer/like_selectivity.hpp"
 +
 +#include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -218,6 +249,7 @@ diff -ruN '--exclude=*.bak*' duckdb-clean/src/optimizer/like_selectivity.cpp duc
 +#include "duckdb/planner/expression/bound_constant_expression.hpp"
 +#include "duckdb/planner/expression/bound_function_expression.hpp"
 +#include "duckdb/planner/expression/bound_operator_expression.hpp"
++#include <cstdio>
 +#include <cstdlib>
 +#include <fstream>
 +
@@ -257,8 +289,7 @@ diff -ruN '--exclude=*.bak*' duckdb-clean/src/optimizer/like_selectivity.cpp duc
 +		// (e.g. "% foo bar %"), so whitespace-based tokenization is unsafe.
 +		auto tab_pos = line.find_last_of('\t');
 +		if (tab_pos == string::npos || tab_pos == 0) {
-+			// Malformed line: skip it, but keep loading the rest of the
-+			// file instead of aborting on the first bad entry.
++			// Malformed line: skip it, but keep loading the rest of the file.
 +			continue;
 +		}
 +
@@ -276,9 +307,7 @@ diff -ruN '--exclude=*.bak*' duckdb-clean/src/optimizer/like_selectivity.cpp duc
 +			continue;
 +		}
 +
-+		// Selectivities are probabilities: clamp defensively so a bad or
-+		// adversarial file entry can't make the optimizer inflate a
-+		// filtered cardinality above the pre-filter cardinality.
++		// Selectivities are probabilities: clamp defensively.
 +		if (value < 0.0) {
 +			value = 0.0;
 +		} else if (value > 1.0) {
@@ -306,12 +335,16 @@ diff -ruN '--exclude=*.bak*' duckdb-clean/src/optimizer/like_selectivity.cpp duc
 +	return true;
 +}
 +
++//! Optional trace: export DUCKDB_LIKE_DEBUG=1
++static bool LikeDebug() {
++	static const bool on = std::getenv("DUCKDB_LIKE_DEBUG") != nullptr;
++	return on;
++}
++
 +//! Checks whether `upper` is the FilterCombiner's standard range-encoding
 +//! of a prefix pattern whose lower bound is `lower` - i.e. `upper` equals
 +//! `lower` with trailing 0xFF bytes stripped and the final remaining byte
 +//! incremented by one (the smallest string that is NOT prefixed by `lower`).
-+//! Handles the common single-increment case; does not attempt every possible
-+//! carry/overflow edge case DuckDB's internal encoder might produce.
 +static bool IsPrefixRangeUpperBound(const string &lower, const string &upper) {
 +	if (lower.empty()) {
 +		return false;
@@ -328,146 +361,165 @@ diff -ruN '--exclude=*.bak*' duckdb-clean/src/optimizer/like_selectivity.cpp duc
 +	return upper == expected;
 +}
 +
-+bool LikeSelectivity::TryGetLikeSelectivity(const Expression &expr, double &selectivity_out) {
-+	// FilterCombiner rewrites simple prefix patterns ('word%') into a range:
-+	// (col >= 'word') AND (col < '<word, last byte incremented>'). Recognize
-+	// that specific shape and reconstruct the original prefix pattern.
-+	// NOTE: in this DuckDB version, comparisons (>=, <) are represented as
-+	// BoundFunctionExpression, not a separate expression class - use the
-+	// BoundComparisonExpression static helpers (Left/Right/IsComparison) to
-+	// inspect them, and the child's own GetExpressionType() for which
-+	// comparison it is (kept in sync with the function via SetType/FlipType).
-+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
-+		auto &conj = expr.Cast<BoundConjunctionExpression>();
-+		if (conj.GetExpressionType() != ExpressionType::CONJUNCTION_AND) {
-+			return false;
-+		}
-+		auto &conj_children = conj.GetChildren();
-+		if (conj_children.size() != 2) {
-+			return false;
-+		}
-+		string lower_bound, upper_bound;
-+		bool has_lower = false, has_upper = false;
-+		for (auto &child : conj_children) {
-+			if (child->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
-+				return false;
-+			}
-+			if (!BoundComparisonExpression::IsComparison(*child)) {
-+				return false;
-+			}
-+			auto &func_expr = child->Cast<BoundFunctionExpression>();
-+			auto &right_expr = BoundComparisonExpression::Right(func_expr);
-+			if (right_expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
-+				return false;
-+			}
-+			auto &val = right_expr.Cast<BoundConstantExpression>().GetValue();
-+			if (val.IsNull() || val.type().id() != LogicalTypeId::VARCHAR) {
-+				return false;
-+			}
-+			auto bound_str = StringValue::Get(val);
-+			auto cmp_type = child->GetExpressionType();
-+			if (cmp_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
-+				lower_bound = bound_str;
-+				has_lower = true;
-+			} else if (cmp_type == ExpressionType::COMPARE_LESSTHAN) {
-+				upper_bound = bound_str;
-+				has_upper = true;
-+			} else {
-+				return false;
-+			}
-+		}
-+		if (has_lower && has_upper && IsPrefixRangeUpperBound(lower_bound, upper_bound)) {
-+			string reconstructed_pattern = lower_bound + "%";
-+			return LikeSelectivity::Get().TryLookup(reconstructed_pattern, selectivity_out);
-+		}
-+		return false;
-+	}
-+
-+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR &&
-+	    expr.GetExpressionType() == ExpressionType::OPERATOR_NOT) {
-+		// A simple single-wildcard NOT LIKE pattern (e.g. NOT LIKE '%word%') gets
-+		// optimizer-transformed into "NOT contains(col, 'word')" rather than staying
-+		// as the literal "!~~" operator. Recurse into the positive child expression
-+		// and negate its selectivity (1 - selectivity), same as the "!~~" case below.
-+		auto &op_expr = expr.Cast<BoundOperatorExpression>();
-+		auto &children = op_expr.GetChildren();
-+		if (children.size() != 1) {
-+			return false;
-+		}
-+		double positive_selectivity;
-+		if (TryGetLikeSelectivity(*children[0], positive_selectivity)) {
-+			selectivity_out = 1.0 - positive_selectivity;
-+			return true;
-+		}
-+		return false;
-+	}
-+
-+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
-+		return false;
-+	}
-+	auto &func = expr.Cast<BoundFunctionExpression>();
-+	auto &children = func.GetChildren();
++//! (col >= 'p') AND (col < 'p+1')  ->  pattern "p%"
++template <class CHILDREN>
++static bool TryPrefixRange(const CHILDREN &children, string &pattern_out) {
 +	if (children.size() != 2) {
 +		return false;
 +	}
++	string lower_bound, upper_bound;
++	bool has_lower = false, has_upper = false;
++	for (auto &child : children) {
++		if (child->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION ||
++		    !BoundComparisonExpression::IsComparison(*child)) {
++			return false;
++		}
++		auto &func_expr = child->template Cast<BoundFunctionExpression>();
++		const Expression &right_expr = BoundComparisonExpression::Right(func_expr);
++		if (right_expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++			return false;
++		}
++		auto &val = right_expr.Cast<BoundConstantExpression>().GetValue();
++		if (val.IsNull() || val.type().id() != LogicalTypeId::VARCHAR) {
++			return false;
++		}
++		auto cmp_type = child->GetExpressionType();
++		if (cmp_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
++			lower_bound = StringValue::Get(val);
++			has_lower = true;
++		} else if (cmp_type == ExpressionType::COMPARE_LESSTHAN) {
++			upper_bound = StringValue::Get(val);
++			has_upper = true;
++		} else {
++			return false;
++		}
++	}
++	if (has_lower && has_upper && IsPrefixRangeUpperBound(lower_bound, upper_bound)) {
++		pattern_out = lower_bound + "%";
++		return true;
++	}
++	return false;
++}
 +
-+	auto &pattern_expr = *children[1];
-+	if (pattern_expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
-+		// non-constant pattern (e.g. a correlated column): nothing to look up
++//! One LIKE-shaped function: ~~, !~~, contains, prefix, suffix, >=
++//!
++//! DuckDB's LikeOptimizationRule transforms LIKE patterns:
++//!   '%word%' -> contains(col, 'word')
++//!   'word%'  -> prefix(col, 'word')
++//!   '%word'  -> suffix(col, 'word')
++//!   others   -> stay as ~~
++//! FilterCombiner may further turn 'word%' into col >= 'word' AND col < '...'.
++//! We reconstruct the original pattern for an exact lookup in the file.
++//! GLOB variants ("~~~", "!~~~") and ILIKE are intentionally unhandled.
++static bool TryGetFunctionSelectivity(const BoundFunctionExpression &func, double &selectivity_out) {
++	auto &children = func.GetChildren();
++	if (children.size() != 2 || children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
++		// non-constant pattern: nothing to look up
 +		return false;
 +	}
-+	auto &pattern_value = pattern_expr.Cast<BoundConstantExpression>().GetValue();
++	auto &pattern_value = children[1]->Cast<BoundConstantExpression>().GetValue();
 +	if (pattern_value.IsNull() || pattern_value.type().id() != LogicalTypeId::VARCHAR) {
 +		return false;
 +	}
 +	auto &raw = StringValue::Get(pattern_value);
-+
-+	// DuckDB's LikeOptimizationRule transforms LIKE patterns:
-+	// - '%word%' -> contains(col, 'word')     [strip both wildcards]
-+	// - 'word%'  -> prefix(col, 'word')       [strip trailing wildcard]
-+	// - '%word'  -> suffix(col, 'word')       [strip leading wildcard]
-+	// - simple patterns stay as ~~ (LIKE operator)
-+	//
-+	// FilterCombiner also transforms prefix patterns into ranges:
-+	// - 'word%'  -> col >= 'word' AND col < '<word with last char incremented>'
-+	//
-+	// We reconstruct the original LIKE pattern from these transformed forms
-+	// to do exact match lookup in the selectivity file.
-+	// 
-+	// NOT LIKE ("!~~") and GLOB variants ("~~~", "!~~~") are intentionally left unhandled.
 +	auto &name = func.Function().GetName();
-+	string pattern;
 +
++	string pattern;
++	bool negate = false;
 +	if (name == "~~") {
-+		// Original LIKE pattern, no transformation needed
 +		pattern = raw;
 +	} else if (name == "!~~") {
-+		// Original NOT LIKE pattern: look up the positive pattern, then negate.
-+		double positive_selectivity;
-+		if (LikeSelectivity::Get().TryLookup(raw, positive_selectivity)) {
-+			selectivity_out = 1.0 - positive_selectivity;
-+			return true;
-+		}
-+		return false;
++		// NOT LIKE: look up the positive pattern, then negate.
++		pattern = raw;
++		negate = true;
 +	} else if (name == "contains") {
-+		// Reconstructed from '%word%' pattern (both wildcards stripped)
 +		pattern = "%" + raw + "%";
-+	} else if (name == "prefix") {
-+		// Reconstructed from 'word%' pattern (trailing wildcard stripped)
++	} else if (name == "prefix" || name == ">=") {
 +		pattern = raw + "%";
 +	} else if (name == "suffix") {
-+		// Reconstructed from '%word' pattern (leading wildcard stripped)
 +		pattern = "%" + raw;
-+	} else if (name == ">=") {
-+		// Reconstructed from range optimization of 'word%' pattern
-+		// The >= contains the prefix part of what was 'word%'
-+		pattern = raw + "%";
 +	} else {
 +		return false;
 +	}
 +
-+	// Do exact match lookup in the file
-+	return LikeSelectivity::Get().TryLookup(pattern, selectivity_out);
++	double s;
++	bool hit = LikeSelectivity::Get().TryLookup(pattern, s);
++	if (LikeDebug()) {
++		fprintf(stderr, "[LIKESEL] fn=%s key='%s' hit=%d\n", name.c_str(), pattern.c_str(), (int)hit);
++	}
++	if (!hit) {
++		return false;
++	}
++	selectivity_out = negate ? 1.0 - s : s;
++	return true;
++}
++
++bool LikeSelectivity::TryGetLikeSelectivity(const Expression &expr, double &selectivity_out) {
++	switch (expr.GetExpressionClass()) {
++	case ExpressionClass::BOUND_CONJUNCTION: {
++		auto &conj = expr.Cast<BoundConjunctionExpression>();
++		auto &children = conj.GetChildren();
++
++		if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
++			// 1) the FilterCombiner's prefix range
++			string pattern;
++			if (TryPrefixRange(children, pattern)) {
++				bool hit = LikeSelectivity::Get().TryLookup(pattern, selectivity_out);
++				if (LikeDebug()) {
++					fprintf(stderr, "[LIKESEL] range key='%s' hit=%d\n", pattern.c_str(), (int)hit);
++				}
++				return hit;
++			}
++			// 2) general AND: multiply every child we can resolve (independence assumption).
++			//    Unresolvable children are skipped, i.e. they contribute selectivity 1.
++			double combined = 1.0;
++			bool found = false;
++			for (auto &child : children) {
++				double s;
++				if (TryGetLikeSelectivity(*child, s)) {
++					combined *= s;
++					found = true;
++				}
++			}
++			if (found) {
++				selectivity_out = combined;
++			}
++			return found;
++		}
++
++		if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
++			// OR needs ALL children resolved; otherwise the union is unknowable.
++			double miss = 1.0;
++			for (auto &child : children) {
++				double s;
++				if (!TryGetLikeSelectivity(*child, s)) {
++					return false;
++				}
++				miss *= (1.0 - s);
++			}
++			selectivity_out = 1.0 - miss;
++			return true;
++		}
++		return false;
++	}
++	case ExpressionClass::BOUND_OPERATOR: {
++		// NOT contains(col, 'word') etc: recurse and negate.
++		if (expr.GetExpressionType() != ExpressionType::OPERATOR_NOT) {
++			return false;
++		}
++		auto &children = expr.Cast<BoundOperatorExpression>().GetChildren();
++		double s;
++		if (children.size() == 1 && TryGetLikeSelectivity(*children[0], s)) {
++			selectivity_out = 1.0 - s;
++			return true;
++		}
++		return false;
++	}
++	case ExpressionClass::BOUND_FUNCTION:
++		return TryGetFunctionSelectivity(expr.Cast<BoundFunctionExpression>(), selectivity_out);
++	default:
++		return false;
++	}
 +}
 +
 +} // namespace duckdb
